@@ -308,6 +308,10 @@ def fmt_date(ts: int) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y")
 
 
+def fmt_datetime(ts: int) -> str:
+    return datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y %H:%M")
+
+
 async def notify_admin(bot: Bot, text: str) -> None:
     try:
         await bot.send_message(ADMIN_ID, text)
@@ -550,10 +554,12 @@ async def cmd_revoke(m: Message, command: CommandObject, bot: Bot):
 @router.message(Command("stats"), F.from_user.id == ADMIN_ID)
 async def cmd_stats(m: Message):
     s = await dbx(db.stats, int(time.time()))
+    created = await dbx(db.get_setting, "db_created")
     await m.answer(
         f"Активных подписок: {s['active']}\n"
         f"Закончатся за 7 дней: {s['soon']}\n"
-        f"Платежей через бота: {s['payments']} на {s['total_kopecks'] / 100:.0f} ₽"
+        f"Платежей через бота: {s['payments']} на {s['total_kopecks'] / 100:.0f} ₽\n"
+        f"База создана: {fmt_datetime(int(created)) if created else '—'} (файл {escape(DB_FILE)})"
     )
 
 
