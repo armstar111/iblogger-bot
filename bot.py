@@ -134,9 +134,13 @@ TEXTS = {
 Здесь ты научишься вести блог с нуля: от страха камеры до первых денег с контента.
 
 <b>Что внутри:</b>
-1. Пошаговые уроки голосом и текстом
-2. Разборы реальных роликов
+1. Пошаговые уроки голосом текстом и видео
+2. Разборы залетевших роликов
 3. Задания с личной обратной связью
+4. Список оборудования для съемки
+5. Полезные ИИ инструменты и как в них работать
+6. Как выйти на первый доход
+И многое другое
 
 💳 <b>Подписка:</b>
 {tariffs}
@@ -147,9 +151,13 @@ TEXTS = {
 Bu yerda blogni noldan yuritishni o'rganasiz: kamera qo'rquvidan kontentdan birinchi daromadgacha.
 
 <b>Kanalda nimalar bor:</b>
-1. Ovozli va matnli bosqichma-bosqich darslar
-2. Haqiqiy videolar tahlili
+1. Ovozli, matnli va videoli bosqichma-bosqich darslar
+2. Trendga chiqqan videolar tahlili
 3. Shaxsiy fikr-mulohaza bilan topshiriqlar
+4. Suratga olish uchun jihozlar ro'yxati
+5. Foydali sun'iy intellekt (AI) vositalari va ular bilan ishlash
+6. Birinchi daromadga qanday chiqish mumkin
+Va yana ko'p narsalar
 
 💳 <b>Obuna:</b>
 {tariffs}
