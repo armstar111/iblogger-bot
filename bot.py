@@ -1,16 +1,18 @@
-"""Бот платной подписки на закрытый канал iBloger.
+"""Бот платного доступа в закрытый канал iBloger.
+
+Два режима (выбираются в .env):
+  • LIFETIME_PRICE=1990 — разовая оплата, доступ навсегда. Тарифы TARIFFS тогда не используются.
+  • LIFETIME_PRICE не задан — подписка на срок по тарифам TARIFFS (как раньше).
 
 Как это работает:
-  1. Человек жмёт «Вступить в канал» → выбирает тариф → Telegram показывает окно оплаты (ЮKassa).
-  2. После оплаты бот записывает подписку в базу и присылает ссылку в канал. Ссылка работает через
-     заявки на вступление: бот сам одобряет заявку, только если у человека есть активная подписка.
-  3. Раз в CHECK_EVERY_SEC секунд бот проверяет базу:
+  1. Человек жмёт «Вступить в канал» → Telegram показывает окно оплаты (ЮKassa).
+  2. После оплаты бот записывает доступ в базу и присылает ссылку в канал. Ссылка работает через
+     заявки на вступление: бот сам одобряет заявку, только если у человека есть оплаченный доступ.
+  3. Для подписок на срок раз в CHECK_EVERY_SEC секунд бот проверяет базу:
        - за REMIND_DAYS дней до конца присылает напоминание с кнопкой «Оплатить»;
        - когда срок вышел, убирает человека из канала.
+     Доступ навсегда эта проверка не трогает.
   4. Вопросы подписчиков приходят тебе в личку, ответ реплаем уходит обратно.
-
-Автосписаний нет: встроенные платежи Telegram их не поддерживают.
-Продление = новая оплата, дни добавляются к концу текущей подписки.
 """
 import asyncio
 import json
@@ -54,7 +56,9 @@ REMIND_DAYS = int(os.getenv("REMIND_DAYS", "3"))
 CHECK_EVERY_SEC = int(os.getenv("CHECK_EVERY_SEC", "3600"))
 SEND_RECEIPT = os.getenv("SEND_RECEIPT", "0") == "1"  # 1 — отправлять данные чека в ЮKassa
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
-DB_FILE = os.getenv("DB_FILE", "bot.db")
+# База хранится в DB_FILE. Если он не задан, берётся папка постоянного хранилища DATA_DIR (её задаёт Bothost),
+# а если нет и её, то файл bot.db рядом с ботом (как на твоём компьютере).
+DB_FILE = os.getenv("DB_FILE") or os.path.join(os.getenv("DATA_DIR", ""), "bot.db")
 # Языки сообщений бота. Только русский: LANGS=ru. Русский и узбекский: LANGS=ru,uz
 LANGS = [l for l in (x.strip() for x in os.getenv("LANGS", "ru").split(",")) if l in ("ru", "uz")] or ["ru"]
 
@@ -82,12 +86,23 @@ def parse_tariffs() -> list[tuple[int, int]]:
 TARIFFS = parse_tariffs()        # [(дней, цена в ₽), ...] от короткого к длинному
 TARIFF_PRICE = dict(TARIFFS)     # дней → цена
 
+# Разовая оплата с доступом навсегда. Если задана, бот продаёт только её.
+try:
+    LIFETIME_PRICE = int(os.getenv("LIFETIME_PRICE", "0").strip() or 0)
+except ValueError:
+    raise SystemExit("Неверный LIFETIME_PRICE в .env. Нужно целое число рублей, например LIFETIME_PRICE=1990")
+LIFETIME = LIFETIME_PRICE > 0
+FOREVER = db.FOREVER
+FOREVER_PAYLOAD = "forever"
+
 # Telegram не создаёт счета на сумму меньше эквивалента ~1 доллара. Для рубля сейчас это около 88 ₽
 # (по currencies.json от Telegram), порог зависит от курса и может меняться.
 MIN_INVOICE_RUB = 90
 
 
 def below_minimum() -> list[tuple[int, int]]:
+    if LIFETIME:
+        return [(0, LIFETIME_PRICE)] if LIFETIME_PRICE < MIN_INVOICE_RUB else []
     return [(d, p) for d, p in TARIFFS if p < MIN_INVOICE_RUB]
 
 
@@ -114,8 +129,32 @@ def tariffs_text(lang: str) -> str:
     return "\n".join(f"• {period_label(d, lang)} — {p} ₽{tariff_tail(d, p)}" for d, p in TARIFFS)
 
 
+def price_block(lang: str) -> str:
+    """Блок с ценой в приветствии: одна цена навсегда или список тарифов подписки."""
+    if LIFETIME:
+        if lang == "ru":
+            return f"💳 <b>Цена: {LIFETIME_PRICE} ₽</b>\nОплата один раз, доступ навсегда."
+        return f"💳 <b>Narxi: {LIFETIME_PRICE} ₽</b>\nBir marta to'lanadi, kirish umrbod."
+    if lang == "ru":
+        return f"💳 <b>Подписка:</b>\n{tariffs_text(lang)}\n\nАвтосписания нет: перед окончанием я напомню о продлении."
+    return (f"💳 <b>Obuna:</b>\n{tariffs_text(lang)}\n\n"
+            "Avtomatik yechib olinmaydi: tugashidan oldin uzaytirishni eslataman.")
+
+
+def is_forever(ts: int) -> bool:
+    return ts >= FOREVER
+
+
+def until_text(ts: int, lang: str) -> str:
+    """«навсегда» или «до 01.12.2026» — для сообщений о доступе."""
+    if is_forever(ts):
+        return "<b>навсегда</b>" if lang == "ru" else "<b>umrbod</b>"
+    date = datetime.fromtimestamp(ts, TZ).strftime("%d.%m.%Y")
+    return f"до <b>{date}</b>" if lang == "ru" else f"<b>{date}</b> gacha"
+
+
 def days_from_payload(payload: str) -> int:
-    """payload счёта имеет вид sub:90. Если не разобрать, даём самый короткий срок."""
+    """payload счёта подписки имеет вид sub:90 (у разовой оплаты payload = "forever"). Если не разобрать, даём самый короткий срок."""
     try:
         kind, value = payload.split(":")
         if kind == "sub" and int(value) > 0:
@@ -134,18 +173,15 @@ TEXTS = {
 Здесь ты научишься вести блог с нуля: от страха камеры до первых денег с контента.
 
 <b>Что внутри:</b>
-1. Пошаговые уроки голосом текстом и видео
+1. Пошаговые уроки голосом, текстом и видео
 2. Разборы залетевших роликов
 3. Задания с личной обратной связью
-4. Список оборудования для съемки
-5. Полезные ИИ инструменты и как в них работать
+4. Список оборудования для съёмки
+5. Полезные ИИ-инструменты и как в них работать
 6. Как выйти на первый доход
 И многое другое
 
-💳 <b>Подписка:</b>
-{tariffs}
-
-Автосписания нет: перед окончанием я напомню о продлении.""",
+{price_block}""",
         "uz": """Salom! 👋 Bu <b>iBloger</b> kanalining boti.
 
 Bu yerda blogni noldan yuritishni o'rganasiz: kamera qo'rquvidan kontentdan birinchi daromadgacha.
@@ -159,21 +195,18 @@ Bu yerda blogni noldan yuritishni o'rganasiz: kamera qo'rquvidan kontentdan biri
 6. Birinchi daromadga qanday chiqish mumkin
 Va yana ko'p narsalar
 
-💳 <b>Obuna:</b>
-{tariffs}
-
-Avtomatik yechib olinmaydi: tugashidan oldin uzaytirishni eslataman.""",
+{price_block}""",
     },
     "paid_ok": {
         "ru": """Оплата прошла ✅
-Доступ открыт до <b>{date}</b>.
+Доступ открыт {until}.
 
 Ссылка в канал:
 {link}
 
 Нажмите на неё и отправьте заявку на вступление. Я одобрю её автоматически.""",
         "uz": """To'lov qabul qilindi ✅
-Kirish <b>{date}</b> gacha ochiq.
+Kirish {until} ochiq.
 
 Kanalga havola:
 {link}
@@ -181,18 +214,18 @@ Kanalga havola:
 Uni bosing va qo'shilish uchun ariza yuboring. Men uni avtomatik tasdiqlayman.""",
     },
     "paid_no_link": {
-        "ru": """Оплата прошла ✅ Доступ открыт до <b>{date}</b>, но ссылку создать не получилось. Автор уже уведомлён.
-Через несколько минут нажмите «Моя подписка» → «Получить ссылку». Если не получится, напишите через «Задать вопрос».""",
-        "uz": """To'lov qabul qilindi ✅ Kirish <b>{date}</b> gacha ochiq, lekin havolani yaratib bo'lmadi. Muallifga xabar berildi.
-Bir necha daqiqadan keyin «Mening obunam» → «Havola» tugmasini bosing.""",
+        "ru": """Оплата прошла ✅ Доступ открыт {until}, но ссылку создать не получилось. Автор уже уведомлён.
+Через несколько минут нажмите «Мой доступ» → «Получить ссылку». Если не получится, напишите через «Задать вопрос».""",
+        "uz": """To'lov qabul qilindi ✅ Kirish {until} ochiq, lekin havolani yaratib bo'lmadi. Muallifga xabar berildi.
+Bir necha daqiqadan keyin «Mening kirishim» → «Havola» tugmasini bosing.""",
     },
     "me_active": {
-        "ru": "Подписка активна до <b>{date}</b> ✅",
-        "uz": "Obuna <b>{date}</b> gacha faol ✅",
+        "ru": "Доступ открыт {until} ✅",
+        "uz": "Kirish {until} ochiq ✅",
     },
     "me_none": {
-        "ru": "Активной подписки нет.",
-        "uz": "Faol obuna yo'q.",
+        "ru": "Доступа к каналу пока нет.",
+        "uz": "Kanalga kirish hali yo'q.",
     },
     "link_text": {
         "ru": "Ссылка в канал:\n{link}\n\nНажмите на неё и отправьте заявку на вступление, я одобрю её автоматически.",
@@ -219,8 +252,8 @@ Bir necha daqiqadan keyin «Mening obunam» → «Havola» tugmasini bosing.""",
         "uz": "Rahmat! Javob shu chatga keladi.",
     },
     "join_declined": {
-        "ru": "Для вступления в канал нужна активная подписка. Оформить её можно в боте @{bot}.",
-        "uz": "Kanalga qo'shilish uchun faol obuna kerak. Uni @{bot} botida rasmiylashtirish mumkin.",
+        "ru": "Чтобы вступить в канал, сначала оплатите доступ в боте @{bot}.",
+        "uz": "Kanalga qo'shilish uchun avval @{bot} botida kirish uchun to'lov qiling.",
     },
     "invoice_fail": {
         "ru": "Не получилось создать счёт. Автор уже уведомлён. Попробуйте позже или напишите через «Задать вопрос».",
@@ -235,7 +268,7 @@ Bir necha daqiqadan keyin «Mening obunam» → «Havola» tugmasini bosing.""",
 # Подписи кнопок
 BUTTONS = {
     "subscribe": {"ru": "🚀 Вступить в канал", "uz": "🚀 Kanalga qo'shilish"},
-    "mine": {"ru": "📋 Моя подписка", "uz": "📋 Mening obunam"},
+    "mine": {"ru": "📋 Мой доступ", "uz": "📋 Mening kirishim"},
     "ask": {"ru": "❓ Задать вопрос", "uz": "❓ Savol"},
     "pay": {"ru": "💳 Оплатить", "uz": "💳 To'lash"},
     "link": {"ru": "🔗 Получить ссылку", "uz": "🔗 Havola"},
@@ -246,9 +279,12 @@ BUTTONS = {
 LONG_TEXTS = {"start", "paid_ok", "paid_no_link"}  # между языками в них ставится линия
 
 
-def T(key: str, **kw) -> str:
-    """Текст на всех включённых языках. Язык-специфичное (список тарифов) подставляется само."""
-    parts = [TEXTS[key][lang].format(tariffs=tariffs_text(lang), **kw) for lang in LANGS]
+def T(key: str, until: int | None = None, **kw) -> str:
+    """Текст на всех включённых языках. Язык-специфичное (цена, срок доступа) подставляется само."""
+    parts = []
+    for lang in LANGS:
+        extra = {"until": until_text(until, lang)} if until is not None else {}
+        parts.append(TEXTS[key][lang].format(price_block=price_block(lang), **extra, **kw))
     return ("\n\n———\n\n" if key in LONG_TEXTS else "\n\n").join(parts)
 
 
@@ -291,12 +327,12 @@ def kb_tariffs() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows + [menu_row()])
 
 
-def kb_link() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=B("link"), callback_data="link")],
-        [InlineKeyboardButton(text=B("renew"), callback_data="buy")],
-        menu_row(),
-    ])
+def kb_link(until: int = 0) -> InlineKeyboardMarkup:
+    """Кнопки под сообщением о доступе. «Продлить» нужна только подписке на срок."""
+    rows = [[InlineKeyboardButton(text=B("link"), callback_data="link")]]
+    if not LIFETIME and not is_forever(until):
+        rows.append([InlineKeyboardButton(text=B("renew"), callback_data="buy")])
+    return InlineKeyboardMarkup(inline_keyboard=rows + [menu_row()])
 
 
 # ───────────────────────────── Вспомогательное ─────────────────────────────
@@ -361,15 +397,19 @@ async def send_access(bot: Bot, user_id: int, until: int) -> None:
         url = await get_invite_link(bot)
     except Exception:
         logging.exception("Не удалось создать ссылку для %s", user_id)
-        await bot.send_message(user_id, T("paid_no_link", date=fmt_date(until)), reply_markup=kb_link())
+        await bot.send_message(user_id, T("paid_no_link", until=until), reply_markup=kb_link(until))
         await notify_admin(
             bot,
             f"⚠️ Пользователь {user_id} оплатил, но ссылку в канал создать не удалось. "
             "Проверь, что бот админ канала с правом приглашать участников. "
-            "Пользователь сможет сам получить ссылку кнопкой «Моя подписка».",
+            "Пользователь сможет сам получить ссылку кнопкой «Мой доступ».",
         )
         return
-    await bot.send_message(user_id, T("paid_ok", date=fmt_date(until), link=url), reply_markup=kb_link())
+    await bot.send_message(user_id, T("paid_ok", until=until, link=url), reply_markup=kb_link(until))
+
+
+def admin_until(ts: int) -> str:
+    return "навсегда" if is_forever(ts) else f"до {fmt_date(ts)}"
 
 
 # ───────────────────────────── Пользователь ─────────────────────────────
@@ -389,6 +429,18 @@ async def cb_menu(cb: CallbackQuery, state: FSMContext):
 
 
 async def send_invoice(bot: Bot, chat_id: int, days: int, price: int) -> None:
+    """Счёт на оплату. days=0 — разовая оплата с доступом навсегда."""
+    forever = days == 0
+    if forever:
+        title, payload = "Доступ в канал iBloger", FOREVER_PAYLOAD
+        description = "Доступ к закрытому каналу iBloger навсегда. Оплата один раз."
+        label = item = "Доступ к каналу iBloger навсегда"
+        what = "доступ навсегда"
+    else:
+        title, payload = "Подписка iBloger", f"sub:{days}"
+        description = f"Доступ к закрытому каналу iBloger на {days} дн."
+        label, item = f"Подписка на {days} дн.", f"Доступ к каналу iBloger на {days} дн."
+        what = f"{days} дн."
     extra = {}
     if SEND_RECEIPT:
         # Данные чека для ЮKassa (54-ФЗ). Включай, только если ЮKassa просит чеки.
@@ -397,7 +449,7 @@ async def send_invoice(bot: Bot, chat_id: int, days: int, price: int) -> None:
             "send_email_to_provider": True,
             "provider_data": json.dumps({
                 "receipt": {"items": [{
-                    "description": f"Доступ к каналу iBloger на {days} дн.",
+                    "description": item,
                     "quantity": "1.00",
                     "amount": {"value": f"{price:.2f}", "currency": "RUB"},
                     "vat_code": 1,
@@ -409,19 +461,19 @@ async def send_invoice(bot: Bot, chat_id: int, days: int, price: int) -> None:
     try:
         await bot.send_invoice(
             chat_id=chat_id,
-            title="Подписка iBloger",
-            description=f"Доступ к закрытому каналу iBloger на {days} дн.",
-            payload=f"sub:{days}",
+            title=title,
+            description=description,
+            payload=payload,
             provider_token=PROVIDER_TOKEN,
             currency="RUB",
-            prices=[LabeledPrice(label=f"Подписка на {days} дн.", amount=price * 100)],
+            prices=[LabeledPrice(label=label, amount=price * 100)],
             **extra,
         )
     except TelegramBadRequest as e:
-        logging.exception("Не удалось создать счёт на %s ₽ (%s дн.)", price, days)
+        logging.exception("Не удалось создать счёт на %s ₽ (%s)", price, what)
         await bot.send_message(chat_id, T("invoice_fail"), reply_markup=kb_menu())
         hint = (f" Сумма меньше минимума Telegram (около {MIN_INVOICE_RUB} ₽)." if price < MIN_INVOICE_RUB else "")
-        await notify_admin(bot, f"⚠️ Не удалось создать счёт на {price} ₽ ({days} дн.): {e}.{hint}")
+        await notify_admin(bot, f"⚠️ Не удалось создать счёт на {price} ₽ ({what}): {e}.{hint}")
 
 
 @router.callback_query(F.data == "join")
@@ -437,6 +489,9 @@ async def cb_join(cb: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "buy")
 async def cb_buy(cb: CallbackQuery, bot: Bot):
     await cb.answer()
+    if LIFETIME:  # разовая оплата: сразу счёт
+        await send_invoice(bot, cb.from_user.id, 0, LIFETIME_PRICE)
+        return
     if len(TARIFFS) == 1:  # один тариф: сразу счёт
         await send_invoice(bot, cb.from_user.id, *TARIFFS[0])
         return
@@ -446,6 +501,9 @@ async def cb_buy(cb: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.startswith("buy:"))
 async def cb_buy_tariff(cb: CallbackQuery, bot: Bot):
     await cb.answer()
+    if LIFETIME:  # кнопка тарифа из старого сообщения: теперь продаётся только доступ навсегда
+        await send_invoice(bot, cb.from_user.id, 0, LIFETIME_PRICE)
+        return
     try:
         days = int(cb.data.split(":")[1])
     except (ValueError, IndexError):
@@ -469,13 +527,18 @@ async def on_paid(m: Message, bot: Bot):
     is_new = await dbx(db.add_payment, uid, p.total_amount, p.currency, p.telegram_payment_charge_id)
     if not is_new:
         return  # этот платёж уже обработан
-    days = days_from_payload(p.invoice_payload)
-    until = await dbx(db.extend, uid, m.from_user.username, days)
+    if p.invoice_payload == FOREVER_PAYLOAD:
+        until = await dbx(db.grant_forever, uid, m.from_user.username)
+        what = "доступ навсегда"
+    else:
+        days = days_from_payload(p.invoice_payload)
+        until = await dbx(db.extend, uid, m.from_user.username, days)
+        what = f"тариф {days} дн., доступ {admin_until(until)}"
     await send_access(bot, uid, until)
     await notify_admin(
         bot,
         f"💰 Оплата {p.total_amount / 100:.0f} {p.currency} от {escape(m.from_user.full_name)} "
-        f"(id {uid}). Тариф {days} дн., подписка до {fmt_date(until)}.",
+        f"(id {uid}): {what}.",
     )
 
 
@@ -484,7 +547,7 @@ async def cb_me(cb: CallbackQuery):
     await cb.answer()
     sub = await dbx(db.get_sub, cb.from_user.id)
     if sub and sub["active"] and sub["paid_until"] > int(time.time()):
-        await cb.message.answer(T("me_active", date=fmt_date(sub["paid_until"])), reply_markup=kb_link())
+        await cb.message.answer(T("me_active", until=sub["paid_until"]), reply_markup=kb_link(sub["paid_until"]))
     else:
         await cb.message.answer(T("me_none"), reply_markup=kb_pay())
 
@@ -530,20 +593,32 @@ async def on_question(m: Message, state: FSMContext, bot: Bot):
 # ───────────────────────────── Админ ─────────────────────────────
 @router.message(Command("grant"), F.from_user.id == ADMIN_ID)
 async def cmd_grant(m: Message, command: CommandObject, bot: Bot):
-    """/grant <id> <дней> — выдать доступ вручную (оплата картой, тест). Дни могут быть дробными: 0.002."""
+    """/grant <id> навсегда — выдать доступ навсегда (оплата переводом и т. п.).
+    /grant <id> <дней> — доступ на срок (для теста дни могут быть дробными: 0.002).
+    /grant <id> — в режиме разовой оплаты то же, что «навсегда»."""
+    args = (command.args or "").split()
     try:
-        uid_s, days_s = (command.args or "").split()
-        uid, days = int(uid_s), float(days_s)
-    except ValueError:
-        await m.answer("Формат: /grant 123456789 30")
+        uid = int(args[0])
+        if len(args) > 2:
+            raise ValueError
+        mode = args[1].lower() if len(args) == 2 else ("навсегда" if LIFETIME else "")
+        forever = mode in ("навсегда", "forever")
+        days = 0.0 if forever else float(mode)
+        if not forever and days <= 0:
+            raise ValueError
+    except (ValueError, IndexError):
+        await m.answer("Формат: /grant 123456789 навсегда\nили на срок: /grant 123456789 30")
         return
-    until = await dbx(db.extend, uid, None, days)
+    if forever:
+        until = await dbx(db.grant_forever, uid, None)
+    else:
+        until = await dbx(db.extend, uid, None, days)
     try:
         await send_access(bot, uid, until)
     except (TelegramForbiddenError, TelegramBadRequest):
-        await m.answer("Подписка записана, но пользователь не начинал диалог с ботом, написать ему не могу.")
+        await m.answer("Доступ записан, но пользователь не начинал диалог с ботом, написать ему не могу.")
         return
-    await m.answer(f"Готово: {uid} до {fmt_date(until)}.")
+    await m.answer(f"Готово: {uid}, доступ {admin_until(until)}.")
 
 
 @router.message(Command("revoke"), F.from_user.id == ADMIN_ID)
@@ -563,9 +638,11 @@ async def cmd_revoke(m: Message, command: CommandObject, bot: Bot):
 async def cmd_stats(m: Message):
     s = await dbx(db.stats, int(time.time()))
     created = await dbx(db.get_setting, "db_created")
+    mode = f"разовая оплата {LIFETIME_PRICE} ₽, доступ навсегда" if LIFETIME else "подписка по тарифам"
     await m.answer(
-        f"Активных подписок: {s['active']}\n"
-        f"Закончатся за 7 дней: {s['soon']}\n"
+        f"Режим: {mode}\n"
+        f"С доступом сейчас: {s['active']} (из них навсегда: {s['forever']})\n"
+        f"Подписок на срок, которые закончатся за 7 дней: {s['soon']}\n"
         f"Платежей через бота: {s['payments']} на {s['total_kopecks'] / 100:.0f} ₽\n"
         f"База создана: {fmt_datetime(int(created)) if created else '—'} (файл {escape(DB_FILE)})"
     )
@@ -688,9 +765,9 @@ async def cmd_check(m: Message, command: CommandObject, bot: Bot):
             lines.append(f"Человек {uid}: статус получить не удалось ({escape(str(e))})")
         sub = await dbx(db.get_sub, uid)
         if sub and sub["active"] and sub["paid_until"] > int(time.time()):
-            lines.append(f"В базе: подписка активна до {fmt_date(sub['paid_until'])}")
+            lines.append(f"В базе: доступ открыт {admin_until(sub['paid_until'])}")
         else:
-            lines.append("В базе: активной подписки нет")
+            lines.append("В базе: доступа нет")
     await m.answer("\n".join(lines))
 
 
@@ -706,7 +783,7 @@ async def cmd_unban(m: Message, command: CommandObject, bot: Bot):
     except TelegramBadRequest as e:
         await m.answer(f"Не получилось: {escape(str(e))}")
         return
-    await m.answer(f"Блокировка снята с {uid}. Теперь он может вступить по ссылке, если подписка активна.")
+    await m.answer(f"Блокировка снята с {uid}. Теперь он может вступить по ссылке, если доступ оплачен.")
 
 
 GEO_SERVICES = ("https://ipinfo.io/json", "https://ipapi.co/json/")
@@ -802,7 +879,9 @@ async def watcher(bot: Bot) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    os.makedirs(os.path.dirname(os.path.abspath(DB_FILE)), exist_ok=True)
     db.init(DB_FILE)
+    logging.info("База данных: %s", os.path.abspath(DB_FILE))
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
     dp.include_router(router)
@@ -810,8 +889,13 @@ async def main() -> None:
     await bot.delete_webhook()
     await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
     for days, price in below_minimum():
-        logging.warning("Тариф %s дн. за %s ₽ меньше минимума Telegram (около %s ₽): счёт создаться не сможет. "
-                        "Для проверки с настоящими деньгами ставь от %s ₽.", days, price, MIN_INVOICE_RUB, MIN_INVOICE_RUB)
+        logging.warning("Цена %s ₽ (%s) меньше минимума Telegram (около %s ₽): счёт создаться не сможет. "
+                        "Для проверки с настоящими деньгами ставь от %s ₽.", price,
+                        "навсегда" if days == 0 else f"{days} дн.", MIN_INVOICE_RUB, MIN_INVOICE_RUB)
+    if LIFETIME:
+        logging.info("Режим: разовая оплата %s ₽, доступ навсегда", LIFETIME_PRICE)
+    else:
+        logging.info("Режим: подписка, тарифы %s", TARIFFS)
     logging.info("Бот запущен")
     await dp.start_polling(bot)
 

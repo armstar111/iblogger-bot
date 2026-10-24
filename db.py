@@ -9,6 +9,10 @@ from contextlib import closing
 
 DB_PATH = "bot.db"
 
+# «Навсегда» = срок доступа 1 января 2100 года. Такой доступ никогда не заканчивается:
+# напоминания и исключение из канала его не трогают.
+FOREVER = 4102444800
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS subs (
     user_id      INTEGER PRIMARY KEY,
@@ -48,6 +52,7 @@ def init(path: str | None = None) -> None:
         DB_PATH = path
     with closing(_conn()) as c:
         c.executescript(SCHEMA)
+        c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('db_created', ?)", (str(int(time.time())),))
         c.commit()
 
 
@@ -63,7 +68,7 @@ def extend(user_id: int, username: str | None, days: float, now: int | None = No
     with closing(_conn()) as c:
         row = c.execute("SELECT paid_until FROM subs WHERE user_id = ?", (user_id,)).fetchone()
         base = max(now, row["paid_until"]) if row else now
-        new_until = base + int(days * 86400)
+        new_until = FOREVER if base >= FOREVER else base + int(days * 86400)
         c.execute(
             """INSERT INTO subs (user_id, username, paid_until, active)
                VALUES (?, ?, ?, 1)
@@ -75,6 +80,22 @@ def extend(user_id: int, username: str | None, days: float, now: int | None = No
         )
         c.commit()
         return new_until
+
+
+def grant_forever(user_id: int, username: str | None) -> int:
+    """Открывает доступ навсегда (разовая оплата или /grant ID навсегда)."""
+    with closing(_conn()) as c:
+        c.execute(
+            """INSERT INTO subs (user_id, username, paid_until, active)
+               VALUES (?, ?, ?, 1)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   username = COALESCE(excluded.username, subs.username),
+                   paid_until = excluded.paid_until,
+                   active = 1""",
+            (user_id, username, FOREVER),
+        )
+        c.commit()
+    return FOREVER
 
 
 def add_payment(user_id: int, amount: int, currency: str, charge_id: str) -> bool:
@@ -130,8 +151,11 @@ def stats(now: int) -> dict:
             "SELECT COUNT(*) FROM subs WHERE active = 1 AND paid_until > ? AND paid_until <= ?",
             (now, now + 7 * 86400),
         ).fetchone()[0]
+        forever = c.execute(
+            "SELECT COUNT(*) FROM subs WHERE active = 1 AND paid_until >= ?", (FOREVER,)
+        ).fetchone()[0]
         paid = c.execute("SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM payments").fetchone()
-        return {"active": active, "soon": soon, "payments": paid[0], "total_kopecks": paid[1]}
+        return {"active": active, "soon": soon, "forever": forever, "payments": paid[0], "total_kopecks": paid[1]}
 
 
 def save_question(admin_msg_id: int, user_id: int) -> None:
